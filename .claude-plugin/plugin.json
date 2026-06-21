@@ -1,0 +1,6 @@
+{
+  "name": "chatterbox-mcp",
+  "skills": [
+    "./skills/chatterbox-mcp"
+  ]
+}
