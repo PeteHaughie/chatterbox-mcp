@@ -1,11 +1,12 @@
 """MCP server for Chatterbox TTS — voice cloning and generation."""
 
-import os
 import json
 import uuid
+import base64
+import asyncio
+import threading
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Optional
 
 import soundfile as sf
 
@@ -14,20 +15,23 @@ from mcp.server.fastmcp import FastMCP
 from .model import ChatterboxModel
 from .voices import VoiceManager
 from .model import S3GEN_SR
+from .streaming import StreamManager, StreamSSEServer
 
 OUTPUT_DIR = Path.home() / ".chatterbox-mcp" / "output"
 
 
 @asynccontextmanager
-async def app_lifespan():
+async def app_lifespan(server):
     model = ChatterboxModel(device="cpu")
     model.load()
     voices = VoiceManager()
+    streams = StreamManager()
+    sse_server = StreamSSEServer(streams)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        yield {"model": model, "voices": voices}
+        yield {"model": model, "voices": voices, "streams": streams, "sse_server": sse_server}
     finally:
-        pass
+        sse_server.stop()
 
 
 mcp = FastMCP("chatterbox_mcp", lifespan=app_lifespan)
@@ -78,7 +82,7 @@ async def tts(
         str: JSON with path to the generated WAV file and duration.
     """
     ctx = mcp.get_context()
-    state = ctx.request_context.lifespan_state
+    state = ctx.request_context.lifespan_context
     model: ChatterboxModel = state["model"]
     voices: VoiceManager = state["voices"]
 
@@ -114,6 +118,115 @@ async def tts(
         "duration_seconds": round(duration, 1),
         "sample_rate": sr,
         "voice": voice,
+    })
+
+
+@mcp.tool(
+    name="tts_stream_start",
+    annotations={
+        "title": "Start Streaming TTS",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def tts_stream_start(
+    text: str = ...,
+    voice: str = ...,
+    emotion_adv: float = 0.5,
+    temperature: float = 0.8,
+    top_p: float = 0.95,
+    repetition_penalty: float = 1.2,
+    max_tokens: int = 500,
+    chunk_tokens: int = 25,
+) -> str:
+    """Generate speech and stream it progressively over SSE.
+
+    Returns a URL to an SSE endpoint that delivers PCM audio chunks
+    as they're decoded. The client connects to the URL and plays
+    each chunk sequentially.
+
+    Args:
+        text: Text to speak.
+        voice: Name of the voice profile (created via create_voice_profile).
+        emotion_adv: Exaggeration from 0.0 (flat) to 1.0 (expressive).
+        temperature: Sampling temperature from 0.1 to 1.5.
+        top_p: Nucleus sampling threshold from 0.5 to 1.0.
+        repetition_penalty: Repetition penalty from 1.0 to 1.5.
+        max_tokens: Max speech tokens (approx 25/sec).
+        chunk_tokens: Tokens per decode chunk (25 ≈ 1 second).
+
+    Returns:
+        JSON with stream_url and session_id.
+    """
+    ctx = mcp.get_context()
+    state = ctx.request_context.lifespan_context
+    model: ChatterboxModel = state["model"]
+    voices: VoiceManager = state["voices"]
+    streams: StreamManager = state["streams"]
+    sse_server: StreamSSEServer = state["sse_server"]
+
+    profile = voices.get_profile(voice)
+    if not profile:
+        return json.dumps({
+            "error": f"Voice profile '{voice}' not found. "
+                     f"Available: {[p.name for p in voices.list_profiles()]}"
+        })
+
+    if not text.strip():
+        return json.dumps({"error": "Text cannot be empty"})
+
+    if max_tokens > 2000:
+        max_tokens = 2000
+
+    session = streams.create({
+        "voice": voice,
+        "max_tokens": max_tokens,
+        "chunk_tokens": chunk_tokens,
+    })
+
+    if not sse_server.port:
+        await asyncio.to_thread(sse_server.start)
+
+    ref_path = profile.ref_audio_path if profile.ref_audio_path.exists() else None
+
+    # Generate speech tokens on the main thread (MLX requires this).
+    speech_tokens = model.generate_tokens(
+        text=text,
+        speaker_embedding=profile.speaker_embedding,
+        prompt_tokens=profile.prompt_tokens,
+        emotion_adv=emotion_adv,
+        temperature=temperature,
+        top_p=top_p,
+        repetition_penalty=repetition_penalty,
+        max_tokens=max_tokens,
+    )
+
+    def _decode_chunks():
+        try:
+            for pcm_bytes, chunk_idx in model.decode_chunked(
+                speech_tokens=speech_tokens,
+                ref_audio_path=ref_path,
+                chunk_tokens=chunk_tokens,
+            ):
+                session.push("audio", {
+                    "index": chunk_idx,
+                    "data": base64.b64encode(pcm_bytes).decode(),
+                    "chunk_tokens": chunk_tokens,
+                })
+            session.push("end", {"status": "complete"})
+        except Exception as e:
+            session.push("error", {"message": f"{type(e).__name__}: {e}"})
+        finally:
+            session.state = "done"
+
+    thread = threading.Thread(target=_decode_chunks, daemon=True)
+    thread.start()
+
+    return json.dumps({
+        "stream_url": f"http://127.0.0.1:{sse_server.port}/stream/{session.id}",
+        "session_id": session.id,
     })
 
 
@@ -154,7 +267,7 @@ async def create_voice_profile(
         str: JSON with profile details or error message.
     """
     ctx = mcp.get_context()
-    state = ctx.request_context.lifespan_state
+    state = ctx.request_context.lifespan_context
     model: ChatterboxModel = state["model"]
     voices: VoiceManager = state["voices"]
 
@@ -201,7 +314,7 @@ async def list_voice_profiles() -> str:
         str: JSON array of profile names and metadata.
     """
     ctx = mcp.get_context()
-    voices: VoiceManager = ctx.request_context.lifespan_state["voices"]
+    voices: VoiceManager = ctx.request_context.lifespan_context["voices"]
     profiles = voices.list_profiles()
     return json.dumps([p.meta for p in profiles], indent=2)
 
@@ -226,7 +339,7 @@ async def delete_voice_profile(name: str = ...) -> str:
         str: Confirmation or error message.
     """
     ctx = mcp.get_context()
-    voices: VoiceManager = ctx.request_context.lifespan_state["voices"]
+    voices: VoiceManager = ctx.request_context.lifespan_context["voices"]
     if voices.delete_profile(name):
         return json.dumps({"status": "deleted", "name": name})
     return json.dumps({"error": f"Voice profile '{name}' not found"})

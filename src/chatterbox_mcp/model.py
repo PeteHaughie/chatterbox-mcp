@@ -212,6 +212,15 @@ class ChatterboxModel:
             )
         return wav[0].cpu().numpy()
 
+    def _normalize_text(self, text: str) -> tuple[str, torch.Tensor]:
+        text = text[0].upper() + text[1:] if text and text[0].islower() else text
+        text = " ".join(text.split())
+        text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
+        sot = torch.tensor([[self.t3.hp.start_text_token]], device=self.device)
+        eot = torch.tensor([[self.t3.hp.stop_text_token]], device=self.device)
+        text_tokens = torch.cat([sot, text_tokens, eot], dim=1)
+        return text, text_tokens
+
     def generate(
         self,
         text: str,
@@ -227,14 +236,7 @@ class ChatterboxModel:
     ) -> tuple[np.ndarray, int]:
         if not text.strip():
             text = "You need to add some text for me to talk."
-
-        text = text[0].upper() + text[1:] if text[0].islower() else text
-        text = " ".join(text.split())
-
-        text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
-        sot = torch.tensor([[self.t3.hp.start_text_token]], device=self.device)
-        eot = torch.tensor([[self.t3.hp.stop_text_token]], device=self.device)
-        text_tokens = torch.cat([sot, text_tokens, eot], dim=1)
+        text, text_tokens = self._normalize_text(text)
 
         cond_emb = self.prepare_conditioning(
             speaker_embedding, prompt_tokens, emotion_adv
@@ -252,3 +254,83 @@ class ChatterboxModel:
 
         wav = self.decode_audio(speech_tokens, ref_audio_path)
         return wav, S3GEN_SR
+
+    def generate_chunked(
+        self,
+        text: str,
+        speaker_embedding: np.ndarray,
+        prompt_tokens: np.ndarray,
+        ref_audio_path: str | Path | None = None,
+        emotion_adv: float = 0.5,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        repetition_penalty: float = 1.2,
+        max_tokens: int = 500,
+        chunk_tokens: int = 25,
+        seed: int | None = None,
+    ):
+        """Yields (pcm_int16_bytes, chunk_index) as audio chunks are decoded.
+
+        T3 generates all speech tokens first, then S3Gen decodes them in
+        cumulative chunks. Each chunk extends the waveform, and the new
+        portion is yielded to the caller for streaming.
+        """
+        speech_tokens = self.generate_tokens(
+            text, speaker_embedding, prompt_tokens,
+            emotion_adv, temperature, top_p, repetition_penalty,
+            max_tokens, seed,
+        )
+        yield from self.decode_chunked(speech_tokens, ref_audio_path, chunk_tokens)
+
+    def generate_tokens(
+        self,
+        text: str,
+        speaker_embedding: np.ndarray,
+        prompt_tokens: np.ndarray,
+        emotion_adv: float = 0.5,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        repetition_penalty: float = 1.2,
+        max_tokens: int = 500,
+        seed: int | None = None,
+    ) -> list[int]:
+        """Text → speech tokens (MLX on main thread)."""
+        text, text_tokens = self._normalize_text(text)
+        cond_emb = self.prepare_conditioning(
+            speaker_embedding, prompt_tokens, emotion_adv
+        )
+        return self.generate_speech_tokens(
+            cond_emb,
+            text_tokens.cpu().numpy(),
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            seed=seed,
+        )
+
+    def decode_chunked(
+        self,
+        speech_tokens: list[int],
+        ref_audio_path: str | Path | None = None,
+        chunk_tokens: int = 25,
+    ):
+        """Yields (pcm_int16_bytes, chunk_index) from pre-generated tokens.
+
+        PyTorch S3Gen decode runs on any thread — safe for background use.
+        """
+        if not speech_tokens:
+            return
+        prev_len = 0
+        n = len(speech_tokens)
+        chunk_idx = 0
+        for chunk_end in range(chunk_tokens, n + chunk_tokens, chunk_tokens):
+            chunk_end = min(chunk_end, n)
+            wav = self.decode_audio(speech_tokens[:chunk_end], ref_audio_path)
+            new_samples = len(wav) - prev_len
+            if new_samples > 0:
+                delta = wav[-new_samples:]
+                pcm = (delta * 32767).astype(np.int16).tobytes()
+                yield pcm, chunk_idx
+                chunk_idx += 1
+                prev_len = len(wav)
