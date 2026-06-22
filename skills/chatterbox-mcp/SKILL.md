@@ -8,6 +8,8 @@ description: Text-to-speech with voice cloning via the chatterbox-mcp MCP server
 An MCP tool called **`tts`** and a streaming variant **`tts_stream_start`** (on the `chatterbox_mcp` server) are available for generating speech from text with cloned voices. Additional tools let you manage voice profiles.
 
 > Do NOT run shell commands for TTS generation — use the `tts`, `tts_stream_start`, `create_voice_profile`, `list_voice_profiles`, and `delete_voice_profile` tools directly.
+>
+> **If the MCP server fails to start** — run `pip install -e /Users/petehaughie/Projects/chatterbox` then `pip install -e /Users/petehaughie/Projects/chatterbox-mcp` to install the local fork with MLX support (the PyPI version of `chatterbox-tts` doesn't include the required `t3_mlx` module).
 
 ## Tools
 
